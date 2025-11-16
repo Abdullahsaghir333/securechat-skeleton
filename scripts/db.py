@@ -1,35 +1,34 @@
-# scripts/db.py
-import os
-from dotenv import load_dotenv
+# server/db.py
 import pymysql
+import os
 
-load_dotenv()  # reads .env in project root
+# read DB connection from env (do not commit creds)
+DB_HOST = os.getenv("DB_HOST","127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT","3306"))
+DB_USER = os.getenv("DB_USER","root")
+DB_PASS = os.getenv("DB_PASS","")
+DB_NAME = os.getenv("DB_NAME","securechat")
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "3306"))
-DB_NAME = os.getenv("DB_NAME", "securechat")
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASS")
+def get_conn():
+    return pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER,
+                           password=DB_PASS, database=DB_NAME, autocommit=True,
+                           cursorclass=pymysql.cursors.DictCursor)
 
-def get_connection():
-    return pymysql.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASS,
-        database=DB_NAME,
-        charset='utf8mb4',
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True
-    )
-
-def insert_message(sender_ip, message):
-    conn = get_connection()
-    try:
+def create_user(email, username, salt_bytes, pwd_hash_hex, cert_cn=None):
+    with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO messages (sender_ip, message) VALUES (%s, %s)",
-                (sender_ip, message)
-            )
-    finally:
-        conn.close()
+            sql = "INSERT INTO users (email, username, salt, pwd_hash, cert_cn) VALUES (%s,%s,%s,%s,%s)"
+            cur.execute(sql, (email, username, salt_bytes, pwd_hash_hex, cert_cn))
+    return True
+
+def get_user_by_email(email):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+            return cur.fetchone()
+
+def get_user_by_username(username):
+    with get_conn() as conn():
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+            return cur.fetchone()
