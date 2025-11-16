@@ -1,6 +1,7 @@
+
 #!/usr/bin/env python3
-# scripts/app_client_chat.py
-import socket, struct, json, os, time, base64, hashlib, datetime
+# scripts/app_client_chat.py (client w/ automatic SessionReceipt on Ctrl+C)
+import socket, struct, json, os, time, base64, hashlib, datetime, sys
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives.asymmetric import padding, dh
@@ -9,8 +10,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives import serialization as ser
 
-HOST="127.0.0.1"; PORT = 5000   # change from 3306
-
+HOST="127.0.0.1"; PORT=9443
 CERT_DIR="certs"
 CLIENT_CERT_PEM = open(f"{CERT_DIR}/client.cert.pem","rb").read()
 CLIENT_KEY = open(f"{CERT_DIR}/client.key.pem","rb").read()
@@ -23,7 +23,7 @@ def recv_block(conn):
     if len(raw)<4: raise ConnectionError()
     sz = struct.unpack("!I", raw)[0]; buf=b""
     while len(buf)<sz:
-        chunk=conn.recv(sz-len(buf))
+        chunk=conn.recv(sz-len(buf)); 
         if not chunk: raise ConnectionError()
         buf+=chunk
     return buf
@@ -61,61 +61,98 @@ def load_priv(pem): return ser.load_pem_private_key(pem, password=None)
 def sign(priv, data): return priv.sign(data, padding.PKCS1v15(), hashes.SHA256())
 def verify(pub, sig, data): pub.verify(sig, data, padding.PKCS1v15(), hashes.SHA256())
 
-def log_line(path, line): os.makedirs(os.path.dirname(path), exist_ok=True)
-def append(path,line):
+def append_line(path, line):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path,"a") as f: f.write(line+"\n")
+
+def make_receipt_from_transcript(transcript_path, role, session_id, privkey_pem):
+    if not os.path.exists(transcript_path):
+        lines=[]
+    else:
+        with open(transcript_path,"rb") as f:
+            lines = f.read().splitlines()
+    concat = b"\n".join(lines)
+    digest = hashlib.sha256(concat).digest()
+    sig = sign(load_priv(privkey_pem), digest)
+    receipt = {
+        "type":"receipt",
+        "peer": role,
+        "session_id": session_id,
+        "first_seq": None,
+        "last_seq": None,
+        "transcript_sha256": digest.hex(),
+        "sig": base64.b64encode(sig).decode()
+    }
+    if lines:
+        try:
+            first = int(lines[0].decode().split("|",1)[0])
+            last = int(lines[-1].decode().split("|",1)[0])
+            receipt["first_seq"] = first; receipt["last_seq"] = last
+        except Exception:
+            pass
+    os.makedirs("receipts", exist_ok=True)
+    out_path = f"receipts/client-{session_id}.json"
+    with open(out_path,"w") as f: json.dump(receipt, f, indent=2)
+    return out_path, receipt
 
 def main():
     client_priv = load_priv(CLIENT_KEY)
     session_id = str(int(time.time()))
     transcript_path = f"transcripts/client-{session_id}.log"
-    with socket.create_connection((HOST,PORT)) as conn:
-        # cert verify
-        server_pem = recv_block(conn)
-        ok, info = verify_cert(server_pem, CA_CERT_PEM, expected_cn="server")
-        if not ok: print("bad server cert", info); return
-        send_block(conn, CLIENT_CERT_PEM)
-        resp = recv_block(conn).decode()
-        print("[client] server resp", resp)
-        # get DH params
-        raw = recv_block(conn); j=json.loads(raw.decode())
-        p=int(j["p"]); g=int(j["g"]); B=int(j["B"])
-        nums = dh.DHParameterNumbers(p,g); params = nums.parameters()
-        priv = params.generate_private_key(); A = priv.public_key().public_numbers().y
-        send_block(conn, json.dumps({"type":"dh_client_pub","A":str(A)}).encode())
-        peer_nums = dh.DHPublicNumbers(B, nums); peer_pub = peer_nums.public_key()
-        shared = priv.exchange(peer_pub); K = derive_key(shared)
-        print("[client] derived K:", K.hex())
+    try:
+        with socket.create_connection((HOST, PORT)) as conn:
+            server_pem = recv_block(conn)
+            ok, info = verify_cert(server_pem, CA_CERT_PEM, expected_cn="server")
+            if not ok: print("bad server cert", info); return
+            send_block(conn, CLIENT_CERT_PEM)
+            resp = recv_block(conn).decode(); print("[client] server resp", resp)
+            raw = recv_block(conn); j=json.loads(raw.decode()); p=int(j["p"]); g=int(j["g"]); B=int(j["B"])
+            nums = dh.DHParameterNumbers(p,g); params = nums.parameters()
+            priv = params.generate_private_key(); A = priv.public_key().public_numbers().y
+            send_block(conn, json.dumps({"type":"dh_client_pub","A":str(A)}).encode())
+            peer_nums = dh.DHPublicNumbers(B, nums); peer_pub = peer_nums.public_key()
+            shared = priv.exchange(peer_pub); K = derive_key(shared)
+            print("[client] derived K:", K.hex())
 
-        # interactive send loop
-        seq = 1
-        while True:
-            msg = input("You: ")
-            if not msg: continue
-            ts = int(time.time()*1000)
-            ivct = aes_encrypt(K, msg.encode())
-            ct_b64 = base64.b64encode(ivct).decode()
-            m = str(seq).encode()+b"||"+str(ts).encode()+b"||"+ivct
-            sig = sign(client_priv, hashlib.sha256(m).digest())
-            payload = {"type":"msg","seqno":seq,"ts":ts,"ct":ct_b64,"sig":base64.b64encode(sig).decode()}
-            send_block(conn, json.dumps(payload).encode())
-            # append to transcript
-            server_fp = x509.load_pem_x509_certificate(server_pem).fingerprint(hashes.SHA256()).hex()
-            append(transcript_path, f"{seq}|{ts}|{ct_b64}|{base64.b64encode(sig).decode()}|{server_fp}")
-            # wait ack
-            raw = recv_block(conn); obj=json.loads(raw.decode())
-            if obj.get("type")=="ack":
-                ack_ct = base64.b64decode(obj["ct"]); ack_sig = base64.b64decode(obj["sig"])
-                # verify ack signature
-                server_pub = x509.load_pem_x509_certificate(server_pem).public_key()
-                m2 = str(obj["seqno"]).encode()+b"||"+str(obj["ts"]).encode()+b"||"+ack_ct
+            seq = 1
+            while True:
                 try:
-                    verify(server_pub, ack_sig, hashlib.sha256(m2).digest())
-                    ack_plain = aes_decrypt(K, ack_ct).decode()
-                    print("[server ACK]:", ack_plain)
-                except Exception as e:
-                    print("ACK verify/decrypt fail", e)
-            seq += 1
+                    msg = input("You: ")
+                except EOFError:
+                    break
+                if not msg: continue
+                ts = int(time.time()*1000)
+                ivct = aes_encrypt(K, msg.encode())
+                ct_b64 = base64.b64encode(ivct).decode()
+                m = str(seq).encode()+b"||"+str(ts).encode()+b"||"+ivct
+                sig = sign(client_priv, hashlib.sha256(m).digest())
+                payload = {"type":"msg","seqno":seq,"ts":ts,"ct":ct_b64,"sig":base64.b64encode(sig).decode()}
+                send_block(conn, json.dumps(payload).encode())
+                server_fp = x509.load_pem_x509_certificate(server_pem).fingerprint(hashes.SHA256()).hex()
+                append_line(transcript_path, f"{seq}|{ts}|{ct_b64}|{base64.b64encode(sig).decode()}|{server_fp}")
+                raw = recv_block(conn); obj=json.loads(raw.decode())
+                if obj.get("type")=="ack":
+                    ack_ct = base64.b64decode(obj["ct"]); ack_sig = base64.b64decode(obj["sig"])
+                    server_pub = x509.load_pem_x509_certificate(server_pem).public_key()
+                    m2 = str(obj["seqno"]).encode()+b"||"+str(obj["ts"]).encode()+b"||"+ack_ct
+                    try:
+                        verify(server_pub, ack_sig, hashlib.sha256(m2).digest())
+                        ack_plain = aes_decrypt(K, ack_ct).decode()
+                        print("[server ACK]:", ack_plain)
+                    except Exception as e:
+                        print("ACK verify/decrypt fail", e)
+                seq += 1
+    except KeyboardInterrupt:
+        print("\n[client] interrupted, generating SessionReceipt...")
+        out_path, receipt = make_receipt_from_transcript(transcript_path, "client", session_id, CLIENT_KEY)
+        print("[client] receipt saved:", out_path)
+        print("[client] transcript lines:", end=" ")
+        try:
+            print(len(open(transcript_path,"r").read().splitlines()))
+        except Exception:
+            print("0")
+        sys.exit(0)
 
 if __name__=="__main__":
     main()
+
