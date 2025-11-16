@@ -3,3 +3,4 @@ certs/
 scripts/__pycache__/
 __pycache__/
 per_cipher_analysis.py
+transcripts/
