@@ -1,1 +1,4 @@
 certs/
+.env
+scripts/__pycache__/
+__pycache__/
